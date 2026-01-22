@@ -1,12 +1,51 @@
 # Prompt Hoarder Implementation Plan
 
-Version: 0.5
+Version: 0.6
 
 **Changelog:**
+- v0.6: Comprehensive elaboration with design rationale, trade-off analysis, and architectural justifications for all major decisions
 - v0.5: Added cloud sync ignore patterns (correct iCloud/Dropbox/editor temps), atomic write edge case handling (cross-volume, case-rename, disk full), introduced `PromptSummary` for efficient list views, clarified `body_cache` vs `content`
 - v0.4: Added `FileWatcher` service for external edit detection, specified variable grammar edge cases (first `}}` wins), clarified `order_index` allows gaps, defined import ID conflict resolution dialog
 - v0.3: Added `VaultAccessCoordinator` for bookmark lifecycle, `DatabaseManager` for rebuild process, clarified deletion semantics with app-layer enforcement, documented FTS rebuild strategy
 - v0.2: Initial edge cases and constraints
+
+---
+
+## 0. Vision & Guiding Philosophy
+
+### 0.1 Why This App Exists
+
+AI prompt users accumulate prompts across notes, documents, chat histories, and scattered files. Finding the right prompt at the right moment is slow. Reusing prompts consistently—especially parameterized ones—is tedious. Multi-step prompt sequences ("workflows") are nearly impossible to repeat reliably.
+
+**Prompt Hoarder exists to make prompt retrieval instant and prompt reuse frictionless.**
+
+The core insight: prompts are a new kind of personal knowledge asset, deserving the same care we give to notes, bookmarks, or code snippets. But unlike those, prompts are *living documents*—frequently tweaked, parameterized, and chained together.
+
+### 0.2 Design Principles
+
+These principles guide every architectural and product decision:
+
+1. **Speed above all** — The menu bar must return results faster than you can switch apps. If it's not instant, users will just copy-paste from wherever they stored the prompt.
+
+2. **Files are forever** — Prompts are stored as plain Markdown files. No proprietary format. No database lock-in. If this app disappears tomorrow, users keep all their work.
+
+3. **Local-first, cloud-optional** — Everything works offline. Cloud sync (Phase 2+) is additive, not required. Privacy is a feature.
+
+4. **Rebuild-ability** — The SQLite index can be deleted and rebuilt from vault files at any time. This is the ultimate safety net against corruption or sync issues.
+
+5. **Progressive complexity** — Simple things (search, copy) are instant. Complex things (workflows, variables) are available but not required.
+
+### 0.3 Target User
+
+The primary user is a "prompt power user"—someone who:
+- Maintains 20-500 prompts (not 5, not 10,000)
+- Uses prompts across multiple AI tools (ChatGPT, Claude, Copilot, etc.)
+- Values being able to tweak and version prompts over time
+- May have multi-step processes they repeat regularly
+
+This is *not* a prompt marketplace, sharing platform, or team collaboration tool. It's a personal productivity tool.
+
+---
 
 ## 1. Summary
 
@@ -19,6 +58,18 @@ Native macOS app for storing, finding, and reusing AI prompts. Menu bar-first ac
 - Direct distribution + Sparkle updates
 - CLI deferred to Phase 2 (architecture supports it)
 - Paste injection deferred to Phase 2
+
+### 1.1 Why These Decisions
+
+| Decision | Rationale | Alternatives Considered |
+|----------|-----------|------------------------|
+| **SwiftUI** | Native macOS feel, modern APIs, menu bar support built-in | AppKit (more control but 3x code), Electron (cross-platform but heavy) |
+| **MVVM** | Clean testability, SwiftUI's @Observable makes it natural | MVC (harder to test), TCA (overkill for this scope) |
+| **SPM multi-target** | Clean separation enables future CLI without app dependency pollution | Single target (simpler but blocks CLI), separate repos (coordination overhead) |
+| **GRDB** | Best Swift SQLite library, FTS5 native, migrations built-in, excellent docs | Core Data (overkill, poor FTS), SQLite.swift (no FTS), raw SQLite (too low-level) |
+| **Files + SQLite hybrid** | Best of both: portability (files) + speed (SQLite FTS) | SQLite-only (not portable), Files-only (slow search), JSON (no FTS) |
+| **Direct distribution** | No App Store review delays, no sandboxing restrictions for paste injection | App Store (30% cut, review delays, sandboxing limits paste injection) |
+| **Sparkle** | De facto standard for macOS app updates outside App Store | Manual updates (poor UX), custom solution (why reinvent) |
 
 ---
 
@@ -178,9 +229,72 @@ dependencies: [
 ]
 ```
 
+### 3.2 Dependency Rationale
+
+**GRDB (not Core Data, not SQLite.swift)**
+- Core Data is overkill for this use case and has poor FTS support
+- SQLite.swift lacks FTS5 support entirely
+- GRDB has excellent documentation, active maintenance, built-in migrations, and native FTS5 support
+- GRDB's `@Observable` macro support makes SwiftUI integration seamless
+
+**swift-markdown (not cmark, not custom)**
+- Apple's official library, guaranteed macOS compatibility
+- Good enough for preview rendering; we don't need advanced features
+- Avoids C dependency complexity of cmark
+
+**swift-log (not OSLog directly, not print)**
+- Structured logging with levels
+- Can route to different backends (console, file, remote)
+- Standard Swift ecosystem choice
+
+**KeyboardShortcuts (Phase 2)**
+- Sindre Sorhus's library is the de facto standard
+- Handles global hotkey registration, conflicts, system preferences integration
+- Avoids CGEvent complexity
+
+### 3.3 Why macOS 14.0 Minimum
+
+- `@Observable` macro (cleaner than ObservableObject)
+- Improved `NavigationSplitView` stability
+- Better menu bar popover APIs
+- `SwiftData` available as fallback (though we use GRDB)
+- Cuts support burden; Sonoma+ is 90%+ of active macOS users by 2026
+
 ---
 
 ## 4. Data Model
+
+### 4.0 Data Model Design Rationale
+
+**Why Two Storage Systems (Files + SQLite)?**
+
+This hybrid approach gives us the best of both worlds:
+
+| Concern | Files Alone | SQLite Alone | Hybrid (Our Choice) |
+|---------|-------------|--------------|---------------------|
+| **Portability** | ✅ Plain text, any editor | ❌ Proprietary DB | ✅ Files are portable |
+| **Search speed** | ❌ Must scan all files | ✅ FTS5 is instant | ✅ FTS5 on cached content |
+| **Sync compatibility** | ✅ Git, Dropbox, iCloud | ⚠️ DB conflicts | ✅ Files sync, DB rebuilds |
+| **Corruption recovery** | ✅ Always readable | ❌ DB corruption = data loss | ✅ Rebuild from files |
+| **Metadata queries** | ❌ Parse every file | ✅ Indexed queries | ✅ SQLite for metadata |
+| **Complexity** | Low | Medium | Medium |
+
+The key insight: **files are the source of truth; SQLite is a derived, rebuildable index**.
+
+If SQLite gets corrupted, delete it and rebuild. If files get corrupted, that's a user backup issue (same as any document app).
+
+**Why UUIDs for Prompt IDs?**
+
+- Enables import/export without ID collisions
+- Supports future sync scenarios (merge from multiple devices)
+- Immutable—file can be renamed without breaking references
+- Stored in file front matter for portability
+
+**Why `sqlite_id` Separate from `id`?**
+
+FTS5 requires a stable integer rowid for content mapping. UUIDs can't be rowids. So we have:
+- `sqlite_id`: Auto-increment integer for FTS5 (ephemeral, changes on rebuild)
+- `id`: UUID for app-level identity (stable, survives rebuild)
 
 ### 4.1 SQLite Schema
 
@@ -1061,3 +1175,86 @@ PromptHoarder-Export-2024-01-15/
 - Zero data loss from file/DB sync issues
 - 80%+ test coverage on Core module
 - Clean build with strict concurrency
+
+---
+
+## 13. Key Trade-offs and Why
+
+This section documents major trade-offs we made and the reasoning behind each choice. This is critical context for future development decisions.
+
+### 13.1 Simplicity vs Features
+
+| We Chose | Over | Because |
+|----------|------|---------|
+| Static menu bar icon (MVP) | Dynamic badge/indicators | Simpler, fewer edge cases, Phase 2 enhancement |
+| Manual workflow execution | Automated AI API calls | Dramatically simpler, no API key management, no rate limiting, no cost concerns |
+| Clipboard copy (default) | Paste injection (default) | Works everywhere, no permissions needed, paste is opt-in Phase 2 |
+| Local-only (MVP) | iCloud sync from day 1 | Sync is complex, conflicts are hard, local-first is simpler and faster |
+
+### 13.2 Performance vs Correctness
+
+| We Chose | Over | Because |
+|----------|------|---------|
+| `PromptSummary` for lists | Full `Prompt` everywhere | Avoids loading 500+ file contents into memory for list views |
+| Incremental vault scan (mtime) | Full hash on every launch | 2s vs 30s+ for large vaults; hash on save provides correctness |
+| FTS5 on `body_cache` | FTS5 on live file content | Can't FTS files directly; cache is fast and rebuilds correctly |
+| Debounced FileWatcher | Immediate event handling | Avoids UI spam on rapid file changes (e.g., save loops) |
+
+### 13.3 Safety vs Convenience
+
+| We Chose | Over | Because |
+|----------|------|---------|
+| Archive as default delete | Hard delete | Prompts in workflows can't vanish; archive is reversible |
+| File wins on conflict | DB wins | Files are portable source of truth; DB is derived/rebuildable |
+| Conflict UI (3 options) | Auto-merge | Auto-merge can silently lose data; explicit choice is safer |
+| Security-scoped bookmarks | Direct path storage | Works with sandboxing, survives permission changes |
+
+### 13.4 Flexibility vs Constraints
+
+| We Chose | Over | Because |
+|----------|------|---------|
+| `order_index` gaps allowed | Strict 0,1,2,... ordering | Simplifies drag-drop (insert at midpoint), no renumbering needed |
+| First `}}` wins (variables) | Balanced bracket matching | Simpler parser, predictable behavior, edge cases are rare |
+| YAML front matter | Custom metadata format | Standard, editor support, human-readable |
+
+---
+
+## 14. Future Considerations
+
+Things we explicitly deferred but should keep in mind for architecture:
+
+### 14.1 Phase 2 Preparations (Built Into MVP)
+
+- **CLI support**: `PromptHoarderCore` is a separate target with no UI dependencies
+- **Paste injection**: Menu bar action structure supports adding paste alongside copy
+- **Global hotkeys**: Settings view has placeholder for hotkey configuration
+- **URL scheme**: App delegate structure supports URL handling
+
+### 14.2 Phase 3 Considerations
+
+- **iCloud sync**: File-based storage is sync-friendly; conflict resolution UI already exists
+- **Encryption**: Could encrypt vault files with user passphrase; DB would need key management
+- **Versioning**: Git-friendly file format supports external version control; in-app versioning would need schema changes
+
+### 14.3 Things We're Explicitly Not Building
+
+- **Prompt marketplace / sharing** — Out of scope; this is a personal tool
+- **AI API integration** — Too much complexity, cost, and maintenance
+- **Cross-platform** — macOS-only maximizes native quality
+- **Team features** — Personal productivity, not collaboration
+- **Browser extension** — URL scheme + Shortcuts covers automation needs
+
+---
+
+## 15. Glossary
+
+| Term | Definition |
+|------|------------|
+| **Vault** | The directory containing all prompt Markdown files |
+| **Prompt** | A single Markdown file with YAML front matter containing an AI prompt |
+| **Workflow** | An ordered sequence of prompts to execute step-by-step |
+| **Variable** | A `{{placeholder}}` in prompt content that gets filled at use time |
+| **Archive** | Soft-delete state; prompt hidden from default views but not deleted |
+| **Summary** | Lightweight prompt metadata (no content) for efficient list rendering |
+| **FTS** | Full-Text Search; SQLite FTS5 extension for fast text searching |
+| **Bookmark** | macOS security-scoped bookmark for persistent file access permissions |

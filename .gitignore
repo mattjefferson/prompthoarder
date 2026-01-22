@@ -7,3 +7,22 @@ node_modules/
 dist/
 build/
 coverage/
+
+# bv (beads viewer) local config and caches
+.bv/
+
+# beads local history (auto-backups)
+.beads/.br_history/
+.beads/beads.db
+.beads/beads.db-shm
+.beads/beads.db-wal
+
+# Claude Code
+.claude/
+
+# Swift
+.build/
+.swiftpm/
+*.xcodeproj/xcuserdata/
+*.xcworkspace/xcuserdata/
+DerivedData/
