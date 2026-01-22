@@ -55,6 +55,7 @@ let package = Package(
             dependencies: ["PromptHoarderCore"],
             swiftSettings: [
                 .swiftLanguageMode(.v6),
+                .enableExperimentalFeature("StrictConcurrency"),
             ]
         ),
         // App tests
@@ -63,6 +64,7 @@ let package = Package(
             dependencies: ["PromptHoarder"],
             swiftSettings: [
                 .swiftLanguageMode(.v6),
+                .enableExperimentalFeature("StrictConcurrency"),
             ]
         ),
     ]
