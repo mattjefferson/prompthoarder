@@ -44,6 +44,9 @@ let package = Package(
                 "PromptHoarderCore",
                 .product(name: "Sparkle", package: "Sparkle"),
             ],
+            resources: [
+                .process("Resources")
+            ],
             swiftSettings: [
                 .swiftLanguageMode(.v6),
                 .enableExperimentalFeature("StrictConcurrency"),

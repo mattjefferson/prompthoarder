@@ -10,7 +10,7 @@ struct PromptHoarderApp: App {
                 .environment(appState)
         }
 
-        MenuBarExtra("Prompt Hoarder", systemImage: "doc.text.magnifyingglass") {
+        MenuBarExtra("Prompt Hoarder", image: "MenuBarIcon") {
             MenuBarView()
                 .environment(appState)
         }
