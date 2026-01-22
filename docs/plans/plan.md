@@ -1,6 +1,12 @@
 # Prompt Hoarder Implementation Plan
 
-Version: 0.2
+Version: 0.5
+
+**Changelog:**
+- v0.5: Added cloud sync ignore patterns (correct iCloud/Dropbox/editor temps), atomic write edge case handling (cross-volume, case-rename, disk full), introduced `PromptSummary` for efficient list views, clarified `body_cache` vs `content`
+- v0.4: Added `FileWatcher` service for external edit detection, specified variable grammar edge cases (first `}}` wins), clarified `order_index` allows gaps, defined import ID conflict resolution dialog
+- v0.3: Added `VaultAccessCoordinator` for bookmark lifecycle, `DatabaseManager` for rebuild process, clarified deletion semantics with app-layer enforcement, documented FTS rebuild strategy
+- v0.2: Initial edge cases and constraints
 
 ## 1. Summary
 
@@ -76,26 +82,70 @@ These are explicit product/engineering constraints that affect the MVP design an
 - **Vault files are canonical** (Markdown + YAML front matter). SQLite is a **derived index/cache** for speed.
 - App must be able to **rebuild the DB from the vault** at any time (Settings: "Rebuild Index").
 
-**Atomicity + “no silent data loss”**
+**Atomicity + "no silent data loss"**
 - All writes go through a single coordinator (actor) so we can enforce ordering and de-dup concurrent saves.
 - Any operation that changes content/metadata uses **atomic file writes** (write temp + `replaceItemAt`) and then updates SQLite in a transaction.
 - If DB update fails after writing files, the app shows an error and schedules a rescan; the vault remains correct.
 
+**Atomic write edge cases:**
+| Scenario | Handling |
+|----------|----------|
+| Cross-volume vault (external drive) | Temp file MUST be in vault directory (e.g., `.uuid.tmp`), not `/tmp`. Otherwise `replaceItemAt` falls back to non-atomic copy+delete. |
+| Case-only rename (`Foo.md` → `foo.md`) | Use intermediate: `Foo.md` → `.foo.md.tmp` → `foo.md` (APFS case-insensitive workaround) |
+| Disk full | Check available space before write (heuristic: 2× file size). Fail with clear error before partial write. |
+| Permission denied | Fail fast with actionable error ("Cannot write to vault folder"). Don't leave temp files behind. |
+| File locked by another process | Retry with backoff (3 attempts, 100ms/500ms/1s), then fail with user message. |
+
 **External edits + conflicts**
 - If a file changes on disk while a prompt is open in the editor, do not auto-overwrite.
 - Show a conflict UI with actions: **Keep Mine**, **Use Disk Version**, **Duplicate as New Prompt** (creates a new UUID).
+- **Detection mechanism** (two-layer approach):
+  1. **FSEvents watcher**: Monitor open files in real-time. When change detected, show non-blocking banner in editor: "File changed on disk. [Reload] [Ignore]"
+  2. **Save-time hash check**: Before any save, compare current file hash against hash at load time. If mismatch and FSEvents missed it, show conflict dialog.
+- FSEvents lifecycle: start watching when prompt opens in editor, stop when editor closes. Use `DispatchSource.makeFileSystemObjectSource` for per-file monitoring.
+- Edge case: if file is deleted externally while open, show alert with options: **Save as New File**, **Discard Changes**.
 
 **Vault location + macOS sandboxing**
 - Vault location must be stored as a **security-scoped bookmark** (works for sandboxed + non-sandboxed builds).
-- Import/export and “change vault location” are always done via file pickers (NSOpenPanel/NSSavePanel) to keep permissions correct.
+- Import/export and "change vault location" are always done via file pickers (NSOpenPanel/NSSavePanel) to keep permissions correct.
+- **Bookmark lifecycle management** (via `VaultAccessCoordinator`):
+  - Call `startAccessingSecurityScopedResource()` once at app launch; balance with `stopAccessingSecurityScopedResource()` at termination.
+  - Store bookmark data in UserDefaults (key: `vaultBookmarkData`).
+  - On bookmark resolution failure (user moved/renamed folder externally):
+    1. Show alert: "Vault folder not found at expected location."
+    2. Offer actions: **Locate Vault** (file picker to re-resolve), **Use Default** (reset to `~/Library/Application Support/PromptHoarder/Vault/`).
+    3. After re-resolution, regenerate and store new bookmark.
+  - Bookmark staleness check: attempt resolution on every app launch; if URL differs from stored path, update stored path.
+  - For sandboxed builds: bookmark must be created from NSOpenPanel result to obtain persistent access rights.
 
 **Deletion semantics**
 - Prompts referenced by workflow steps cannot be deleted silently. MVP behavior:
   - Default action: **Archive** (hide from default views, keep file + DB row).
   - If user chooses Delete: block unless they explicitly remove/replace affected workflow steps (and show list of impacted workflows).
+- **App-layer enforcement**: `PromptStore.delete()` must query `workflow_steps` for references *before* attempting deletion. The `ON DELETE RESTRICT` FK constraint is a safety net, not the primary enforcement mechanism.
+- Delete flow: (1) check workflow references, (2) if referenced → return error with affected workflow IDs, (3) if not referenced → delete file atomically, (4) delete DB row in transaction.
+- Archive flow: set `is_archived = 1` in DB and add `archived: true` to file front matter (keeps file/DB in sync).
 
 **FTS correctness**
 - FTS must have a stable integer key for row mapping; UUID remains the app-level identifier.
+
+**Index rebuild process**
+- "Rebuild Index" (Settings) must drop and recreate the entire SQLite database, including FTS tables.
+- Process: (1) close DB connection, (2) delete `index.sqlite*`, (3) create fresh DB with schema, (4) full vault scan to repopulate.
+- `sqlite_id` values are ephemeral and will differ after rebuild—this is acceptable since FTS is also rebuilt.
+- During rebuild, app shows progress UI and blocks edits; menu bar remains functional for copy-only operations using cached data.
+- If rebuild fails mid-process, delete partial DB and retry; vault files remain untouched.
+
+**Import ID conflict resolution**
+- When importing a file whose `id` (from front matter) already exists in the vault:
+  1. **Single file import**: Show dialog with options:
+     - **Import as Copy** (default): Generate new UUID, import as separate prompt. Log maps `oldId → newId`.
+     - **Replace Existing**: Overwrite existing prompt file and DB entry.
+     - **Skip**: Do not import this file.
+  2. **Bulk import**: Same dialog with additional checkbox: "Apply to all conflicts"
+- If imported file has no `id` in front matter: generate new UUID (no conflict possible).
+- If imported file has malformed `id`: treat as no ID, generate new UUID, log warning.
+- `ImportResult.previousId` tracks old→new UUID mapping for audit/undo purposes.
 
 **Variable templating grammar**
 - Define an explicit, testable grammar (see §5.3) including escaping and defaults.
@@ -199,13 +249,18 @@ CREATE TABLE workflow_steps (
     id TEXT PRIMARY KEY,
     workflow_id TEXT NOT NULL,
     prompt_id TEXT NOT NULL,
-    order_index INTEGER NOT NULL,
+    order_index INTEGER NOT NULL,           -- No unique constraint; gaps allowed (e.g., 0,5,10)
     step_notes TEXT,
     variable_overrides TEXT,                -- JSON
     FOREIGN KEY (workflow_id) REFERENCES workflows(id) ON DELETE CASCADE,
     -- Deletion is handled at the product level (archive first; explicit delete requires user action).
     FOREIGN KEY (prompt_id) REFERENCES prompts(id) ON DELETE RESTRICT
 );
+
+-- Note: order_index intentionally has no UNIQUE constraint.
+-- Gaps are allowed to simplify drag-drop reordering (insert at midpoint).
+-- App sorts by order_index ASC; ties broken by id for stability.
+-- Optional: compact indices to 0,1,2,... on workflow save (not required for correctness).
 
 -- FTS5 index
 CREATE VIRTUAL TABLE prompts_fts USING fts5(
@@ -268,21 +323,45 @@ Review the code for {{language}} focusing on:
 ### 4.3 Swift Models
 
 ```swift
-// Core/Models/Prompt.swift
-struct Prompt: Identifiable, Codable, Equatable, Sendable {
+// Core/Models/PromptSummary.swift
+// Lightweight struct for list views—DB-only, no file reads
+struct PromptSummary: Identifiable, Codable, Equatable, Sendable {
     let id: UUID
     var title: String
-    var content: String              // Markdown body (loaded from file)
     var tags: [Tag]
     var category: Category?
     var isFavorite: Bool
+    var isArchived: Bool
+    var createdAt: Date
+    var updatedAt: Date
+    var usageCount: Int
+    var lastUsedAt: Date?
+    // Note: no content field—use Prompt for full content
+}
+
+// Core/Models/Prompt.swift
+// Full struct for detail/edit views—includes file content
+struct Prompt: Identifiable, Codable, Equatable, Sendable {
+    let id: UUID
+    var title: String
+    var content: String              // Full Markdown body (loaded from file on-demand)
+    var tags: [Tag]
+    var category: Category?
+    var isFavorite: Bool
+    var isArchived: Bool
     var createdAt: Date
     var updatedAt: Date
     var usageCount: Int
     var lastUsedAt: Date?
 
     var variables: [PromptVariable] { /* parsed from content */ }
+
+    var summary: PromptSummary { /* project to lightweight form */ }
 }
+
+// Clarification: body_cache vs content
+// - body_cache (DB column): plain text extracted from Markdown, used for FTS indexing
+// - Prompt.content: full Markdown source, loaded from vault file only when needed
 
 struct PromptVariable: Identifiable, Equatable, Sendable {
     let id: String                   // variable name
@@ -322,7 +401,41 @@ struct WorkflowStep: Identifiable, Codable, Equatable, Sendable {
 
 ## 5. Core Services
 
-### 5.1 VaultManager
+### 5.1 VaultAccessCoordinator
+
+Manages security-scoped bookmark lifecycle and vault access permissions.
+
+```swift
+protocol VaultAccessCoordinating: Sendable {
+    /// Current vault URL (nil if bookmark unresolved)
+    var vaultURL: URL? { get }
+
+    /// Attempt to resolve stored bookmark; returns success
+    func resolveBookmark() async -> Bool
+
+    /// Store new bookmark from user-selected URL (NSOpenPanel result)
+    func storeBookmark(for url: URL) throws
+
+    /// Start accessing security-scoped resource (call at app launch)
+    func startAccessing() -> Bool
+
+    /// Stop accessing (call at app termination)
+    func stopAccessing()
+}
+
+enum VaultAccessError: Error {
+    case bookmarkNotFound
+    case bookmarkStale(lastKnownPath: String)
+    case accessDenied
+}
+```
+
+**Implementation notes:**
+- Singleton/actor to ensure balanced start/stop calls
+- Store bookmark in UserDefaults as `Data`
+- Log all access state transitions for debugging permission issues
+
+### 5.2 VaultManager
 
 Handles file system operations and vault scanning.
 
@@ -344,24 +457,130 @@ struct VaultScanResult {
     let modifiedFiles: [URL]
     let deletedIds: [UUID]
 }
+
+struct ImportResult {
+    let url: URL
+    let promptId: UUID?          // nil if import failed
+    let error: ImportError?
+    let previousId: UUID?        // non-nil if ID conflict resulted in new UUID
+}
+
+enum ImportError: Error {
+    case invalidFormat
+    case notUTF8
+    case fileTooLarge
+    case idConflict(existingId: UUID)
+    case parseError(String)
+}
+
+enum WriteError: Error {
+    case insufficientSpace(required: Int64, available: Int64)
+    case permissionDenied(path: URL)
+    case fileLocked(path: URL, afterRetries: Int)
+    case directoryNotFound(path: URL)
+}
 ```
 
 **Vault scan performance (recommendation):**
 - Track `mtime` + file size and only re-hash/re-parse files whose attributes changed.
-- Treat cloud sync artifacts as normal input: files like `*.icloud`, `* (conflicted copy)*`, and temporary editor swap files should be ignored by default.
+- Ignore cloud sync artifacts, temp files, and OS metadata (see ignore patterns below).
 
-### 5.2 PromptStore
+**Ignore patterns for vault scanning:**
+```swift
+static let ignorePatterns: [String] = [
+    // iCloud placeholders (dot prefix + .icloud suffix)
+    #"^\..+\.icloud$"#,
+
+    // Dropbox/OneDrive conflicts
+    #".+ \(.*conflicted copy.*\).+"#,
+
+    // Editor swap/temp files
+    #".+\.swp$"#,
+    #".+~$"#,
+    #"^\.#.+"#,
+    #"^#.+#$"#,
+
+    // macOS metadata
+    #"^\.DS_Store$"#,
+    #"^\._.*"#,
+
+    // Generic temp patterns
+    #".+\.tmp$"#,
+    #".+\.temp$"#,
+]
+```
+- Log skipped files at debug level to help users diagnose "why isn't my prompt showing up?"
+- OneDrive placeholder files (cloud-only) require attribute checks; defer to Phase 2 or document as known limitation.
+
+### 5.2.1 DatabaseManager
+
+Manages SQLite database lifecycle including migrations and rebuild.
+
+```swift
+protocol DatabaseManaging: Sendable {
+    /// Current database connection state
+    var isConnected: Bool { get }
+
+    /// Initialize database, run migrations
+    func initialize() async throws
+
+    /// Full rebuild: drop DB, recreate schema, repopulate from vault
+    func rebuild(progress: @escaping (RebuildProgress) -> Void) async throws
+
+    /// Close connection (for rebuild or shutdown)
+    func close() async
+}
+
+struct RebuildProgress: Sendable {
+    let phase: RebuildPhase
+    let filesProcessed: Int
+    let totalFiles: Int
+}
+
+enum RebuildPhase: Sendable {
+    case deletingOldDatabase
+    case creatingSchema
+    case scanningVault
+    case indexingFiles
+    case rebuildingFTS
+    case complete
+}
+```
+
+**Rebuild safety:**
+- Rebuild acquires exclusive lock; all other DB operations wait or fail fast
+- If rebuild fails, old DB is already deleted; app prompts to retry or quit
+- Consider keeping `.sqlite.backup` until rebuild succeeds for recovery (optional enhancement)
+
+### 5.3 PromptStore
 
 SQLite operations via GRDB.
 
 ```swift
 protocol PromptStoring: Sendable {
-    func fetchAll() async throws -> [Prompt]
+    // List views—fast, DB-only queries (no file reads)
+    func fetchAllSummaries(includeArchived: Bool) async throws -> [PromptSummary]
+    func search(query: String, filters: SearchFilters) async throws -> [PromptSummary]
+
+    // Detail/edit views—loads content from vault file
     func fetch(id: UUID) async throws -> Prompt?
-    func search(query: String, filters: SearchFilters) async throws -> [Prompt]
+
+    // Mutations
     func save(_ prompt: Prompt) async throws
-    func delete(id: UUID) async throws
+    func delete(id: UUID) async throws -> DeleteResult
+    func archive(id: UUID) async throws
     func incrementUsage(id: UUID) async throws
+}
+
+enum DeleteResult {
+    case deleted
+    case blocked(referencingWorkflows: [WorkflowReference])
+}
+
+struct WorkflowReference: Sendable {
+    let workflowId: UUID
+    let workflowTitle: String
+    let stepCount: Int  // how many steps reference this prompt
 }
 
 struct SearchFilters {
@@ -379,7 +598,38 @@ enum SortOption {
 }
 ```
 
-### 5.3 VariableResolver
+### 5.4 FileWatcher
+
+Monitors open files for external changes using DispatchSource.
+
+```swift
+protocol FileWatching: Sendable {
+    /// Start watching a file; calls handler on change or deletion
+    func watch(url: URL, onChange: @escaping (FileChangeEvent) -> Void) -> FileWatchToken
+
+    /// Stop watching (also called when token is deallocated)
+    func stopWatching(_ token: FileWatchToken)
+}
+
+struct FileWatchToken: Sendable {
+    let id: UUID
+    let url: URL
+}
+
+enum FileChangeEvent: Sendable {
+    case modified
+    case deleted
+    case renamed(newURL: URL)
+}
+```
+
+**Implementation notes:**
+- Use `DispatchSource.makeFileSystemObjectSource(fileDescriptor:eventMask:)`
+- Event mask: `.write | .delete | .rename`
+- One source per open file; clean up on editor close
+- Coalesce rapid events (debounce ~100ms) to avoid UI spam
+
+### 5.5 VariableResolver
 
 Parses and resolves `{{variables}}` in prompts.
 
@@ -387,17 +637,38 @@ Parses and resolves `{{variables}}` in prompts.
 protocol VariableResolving: Sendable {
     func extractVariables(from content: String) -> [PromptVariable]
     func resolve(content: String, values: [String: String]) -> String
+    func validate(content: String) -> [VariableWarning]  // For template debugging
+}
+
+struct VariableWarning: Sendable {
+    let range: Range<String.Index>
+    let message: String  // e.g., "Invalid variable name: starts with digit"
 }
 ```
 
-**Variable grammar (recommendation):**
+**Variable grammar (specification):**
 - Token form: `{{ name }}` (whitespace allowed around name)
 - Name regex: `[A-Za-z_][A-Za-z0-9_.-]*`
-- Optional inline default: `{{name=default value}}` (default runs until `}}`; no nesting in MVP)
+- Optional inline default: `{{name=default value}}` (default runs until first `}}`)
 - Escaping: `\{{` renders a literal `{{` and does not start a token
 - Substitution scope: apply to the Markdown body only (exclude YAML front matter)
 
-### 5.4 WorkflowStore
+**Edge case behavior:**
+| Input | Behavior | Rationale |
+|-------|----------|-----------|
+| `{{name=has }} more}}` | Default = `has `, leaves ` more}}` as literal | First `}}` wins (greedy) |
+| `{{outer={{inner}}}}` | Extracts variable named `outer={{inner` | First `}}` wins |
+| `{{}}` or `{{ }}` | Treated as literal text, no substitution | Invalid: empty name |
+| `{{name` | Treated as literal text | Invalid: unclosed token |
+| `{{name=}}` | Valid, empty default; substitutes to `""` if no value provided | Explicit empty default |
+| `{{123name}}` | Treated as literal text | Invalid: name must start with letter/underscore |
+
+**Parser behavior:**
+- Invalid syntax → treat as literal text (no error thrown, no substitution)
+- Log warning for invalid tokens to help users debug templates
+- Future (Phase 2): consider `\}}` escape sequence to allow `}}` in defaults
+
+### 5.6 WorkflowStore
 
 ```swift
 protocol WorkflowStoring: Sendable {
@@ -520,23 +791,52 @@ App/
 
 #### 1.2 Core Data Layer
 - [ ] Implement SQLite schema + migrations (GRDB)
+- [ ] Implement `DatabaseManager` (lifecycle, rebuild)
+  - Full rebuild: delete DB → create schema → scan vault → repopulate
+  - Progress reporting for UI
+  - Exclusive lock during rebuild
 - [ ] Implement `PromptStore` (CRUD, search with FTS5)
+  - `delete()` returns `DeleteResult` with workflow references check
+  - `archive()` for soft-delete (updates file front matter + DB)
+- [ ] Implement `VaultAccessCoordinator` (bookmark lifecycle)
+  - Store/resolve security-scoped bookmarks
+  - Handle stale bookmarks with user prompts
+  - Balance `startAccessing`/`stopAccessing` calls
 - [ ] Implement `VaultManager` (file ops, vault scanning)
+  - Temp files in same directory as target (e.g., `.uuid.tmp`) for true atomicity
+  - Case-only rename workaround for APFS
+  - Pre-write space check, permission validation
+  - Retry with backoff for locked files
+  - Ignore cloud sync artifacts (see ignore patterns in §5.2)
+  - Log skipped files at debug level
 - [ ] Implement file ↔ DB sync logic (file canonical, DB derived)
 - [ ] Implement content hashing for change detection
+- [ ] Implement `FileWatcher` (DispatchSource-based)
+  - Monitor open files for write/delete/rename events
+  - Debounce rapid events (~100ms)
+  - Clean up watchers on editor close
 - [ ] Handle external file edits gracefully
-  - Detect changes via mtime/size/hash
-  - If prompt is open in editor: show conflict UI (Keep Mine / Use Disk / Duplicate)
-- [ ] Vault location migration helper
-  - Store security-scoped bookmarks (sandbox-compatible)
+  - Real-time banner: "File changed on disk. [Reload] [Ignore]"
+  - Save-time hash check as safety net
+  - Conflict UI: Keep Mine / Use Disk / Duplicate as New
+  - Deleted file UI: Save as New File / Discard Changes
 - [ ] Optional backup service (configurable)
 - [ ] Unit tests for storage layer
 
 #### 1.3 Domain Services
 - [ ] Implement `VariableResolver` (regex parsing, substitution)
+  - First `}}` wins parsing strategy
+  - Invalid syntax → literal text + warning log
+  - `validate()` method for template debugging
+  - Unit tests for all edge cases (see §5.5 table)
 - [ ] Implement `TagStore`, `CategoryStore`
 - [ ] Implement `WorkflowStore`
+  - Sort steps by `order_index ASC, id` for stability
+  - Optional: compact indices on save
 - [ ] Implement import service (single file, folder)
+  - ID conflict dialog: Import as Copy / Replace / Skip
+  - Bulk import: "Apply to all conflicts" checkbox
+  - Track old→new UUID mapping in `ImportResult`
 - [ ] Implement export service (single prompt, full library)
 - [ ] Unit tests for services
 
@@ -668,9 +968,15 @@ App/
 
 ### 8.3 Performance Tests
 
-- Search latency: <200ms for 5,000 prompts
-- App launch: <1s to menu bar ready
-- Vault scan: <2s for 5,000 files
+Target: 5,000 prompts (stress test; typical usage expected to be <500)
+
+| Operation | Target | Notes |
+|-----------|--------|-------|
+| Search latency | <200ms | FTS5 query + summary hydration |
+| App launch | <1s to menu bar ready | DB open + initial query only |
+| Vault scan | <2s | Incremental via mtime; full scan on rebuild |
+| List view render | <100ms | Uses `PromptSummary`, no file reads |
+| Detail view open | <50ms | Single file read |
 
 ---
 
@@ -711,14 +1017,17 @@ PromptHoarder-Export-2024-01-15/
 
 ## 10. Risks & Mitigations
 
-| Risk | Impact | Likelihood | Mitigation |
-|------|--------|------------|------------|
-| FTS search too slow at scale | High | Low | Benchmark early, optimize queries, consider external index |
-| File/DB sync drift | High | Medium | File canonical, DB derived; hash + mtime/size; rebuild command; conflict UI |
-| Menu bar popover focus issues | Medium | Medium | Test across macOS versions, fallback behaviors |
-| Accessibility permission UX | Medium | Medium | Clear onboarding, graceful degradation |
-| Markdown parsing edge cases | Low | Medium | Use Apple's swift-markdown, sanitize input |
-| Multi-process contention (future CLI) | Medium | Medium | WAL mode; single-writer coordinator; file-level locks/coordinator; clear error UX |
+| Risk | Impact | Likelihood | Mitigation | Status |
+|------|--------|------------|------------|--------|
+| FTS search too slow at scale | High | Low | Benchmark early; `PromptSummary` for list views; FTS on `body_cache` | ✅ Addressed |
+| File/DB sync drift | High | Medium | File canonical; hash + mtime; rebuild command; `FileWatcher`; conflict UI | ✅ Addressed |
+| Atomic write failures | Medium | Low | Same-dir temp files; case-rename workaround; space check; retry with backoff | ✅ Addressed |
+| Cloud sync artifacts in vault | Medium | Medium | Comprehensive ignore patterns for iCloud/Dropbox/editors; debug logging | ✅ Addressed |
+| Menu bar popover focus issues | Medium | Medium | Test across macOS versions, fallback behaviors | Open |
+| Accessibility permission UX | Medium | Medium | Clear onboarding, graceful degradation (Phase 2) | Open |
+| Markdown parsing edge cases | Low | Medium | Use Apple's swift-markdown, sanitize input | Open |
+| Multi-process contention (future CLI) | Medium | Medium | WAL mode; single-writer coordinator; clear error UX | Open |
+| Security-scoped bookmark staleness | Medium | Medium | `VaultAccessCoordinator`; re-resolve UI; bookmark refresh on launch | ✅ Addressed |
 
 ---
 
