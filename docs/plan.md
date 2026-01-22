@@ -1,5 +1,7 @@
 # Prompt Hoarder Implementation Plan
 
+Version: 0.2
+
 ## 1. Summary
 
 Native macOS app for storing, finding, and reusing AI prompts. Menu bar-first access with full main window for management. Prompts stored as Markdown files; metadata/workflows in SQLite.
@@ -66,6 +68,38 @@ PromptHoarder/
                 └───────────────┘
 ```
 
+### 2.4 Requirements, Constraints, and Edge Cases (Decisions)
+
+These are explicit product/engineering constraints that affect the MVP design and prevent data-loss bugs.
+
+**Source of truth**
+- **Vault files are canonical** (Markdown + YAML front matter). SQLite is a **derived index/cache** for speed.
+- App must be able to **rebuild the DB from the vault** at any time (Settings: "Rebuild Index").
+
+**Atomicity + “no silent data loss”**
+- All writes go through a single coordinator (actor) so we can enforce ordering and de-dup concurrent saves.
+- Any operation that changes content/metadata uses **atomic file writes** (write temp + `replaceItemAt`) and then updates SQLite in a transaction.
+- If DB update fails after writing files, the app shows an error and schedules a rescan; the vault remains correct.
+
+**External edits + conflicts**
+- If a file changes on disk while a prompt is open in the editor, do not auto-overwrite.
+- Show a conflict UI with actions: **Keep Mine**, **Use Disk Version**, **Duplicate as New Prompt** (creates a new UUID).
+
+**Vault location + macOS sandboxing**
+- Vault location must be stored as a **security-scoped bookmark** (works for sandboxed + non-sandboxed builds).
+- Import/export and “change vault location” are always done via file pickers (NSOpenPanel/NSSavePanel) to keep permissions correct.
+
+**Deletion semantics**
+- Prompts referenced by workflow steps cannot be deleted silently. MVP behavior:
+  - Default action: **Archive** (hide from default views, keep file + DB row).
+  - If user chooses Delete: block unless they explicitly remove/replace affected workflow steps (and show list of impacted workflows).
+
+**FTS correctness**
+- FTS must have a stable integer key for row mapping; UUID remains the app-level identifier.
+
+**Variable templating grammar**
+- Define an explicit, testable grammar (see §5.3) including escaping and defaults.
+
 ---
 
 ## 3. Tech Stack
@@ -101,13 +135,15 @@ dependencies: [
 ### 4.1 SQLite Schema
 
 ```sql
--- Prompts (metadata only, content in .md files)
+-- Prompts (SQLite is an index/cache; canonical content/metadata is in the vault file)
 CREATE TABLE prompts (
-    id TEXT PRIMARY KEY,                    -- UUID
+    sqlite_id INTEGER PRIMARY KEY,          -- stable key for FTS content_rowid
+    id TEXT NOT NULL UNIQUE,                -- UUID (app-level identifier; matches file front matter)
     title TEXT NOT NULL,
     file_path TEXT NOT NULL UNIQUE,         -- relative to vault
     category_id TEXT,                       -- FK to categories
     is_favorite INTEGER NOT NULL DEFAULT 0,
+    is_archived INTEGER NOT NULL DEFAULT 0, -- MVP "soft delete"
     content_hash TEXT NOT NULL,             -- SHA256 of file content
     body_cache TEXT NOT NULL,               -- plain text for FTS
     created_at TEXT NOT NULL,               -- ISO8601
@@ -120,8 +156,11 @@ CREATE TABLE prompts (
 -- Tags (many-to-many)
 CREATE TABLE tags (
     id TEXT PRIMARY KEY,
-    name TEXT NOT NULL UNIQUE
+    name TEXT NOT NULL
 );
+
+-- Prefer case-insensitive uniqueness for human-entered tags.
+CREATE UNIQUE INDEX tags_name_nocase ON tags(name COLLATE NOCASE);
 
 CREATE TABLE prompt_tags (
     prompt_id TEXT NOT NULL,
@@ -134,8 +173,10 @@ CREATE TABLE prompt_tags (
 -- Categories
 CREATE TABLE categories (
     id TEXT PRIMARY KEY,
-    name TEXT NOT NULL UNIQUE
+    name TEXT NOT NULL
 );
+
+CREATE UNIQUE INDEX categories_name_nocase ON categories(name COLLATE NOCASE);
 
 -- Workflows
 CREATE TABLE workflows (
@@ -162,7 +203,8 @@ CREATE TABLE workflow_steps (
     step_notes TEXT,
     variable_overrides TEXT,                -- JSON
     FOREIGN KEY (workflow_id) REFERENCES workflows(id) ON DELETE CASCADE,
-    FOREIGN KEY (prompt_id) REFERENCES prompts(id)
+    -- Deletion is handled at the product level (archive first; explicit delete requires user action).
+    FOREIGN KEY (prompt_id) REFERENCES prompts(id) ON DELETE RESTRICT
 );
 
 -- FTS5 index
@@ -170,25 +212,25 @@ CREATE VIRTUAL TABLE prompts_fts USING fts5(
     title,
     body_cache,
     content='prompts',
-    content_rowid='rowid'
+    content_rowid='sqlite_id'
 );
 
 -- Triggers to keep FTS in sync
 CREATE TRIGGER prompts_ai AFTER INSERT ON prompts BEGIN
     INSERT INTO prompts_fts(rowid, title, body_cache)
-    VALUES (NEW.rowid, NEW.title, NEW.body_cache);
+    VALUES (NEW.sqlite_id, NEW.title, NEW.body_cache);
 END;
 
 CREATE TRIGGER prompts_ad AFTER DELETE ON prompts BEGIN
     INSERT INTO prompts_fts(prompts_fts, rowid, title, body_cache)
-    VALUES ('delete', OLD.rowid, OLD.title, OLD.body_cache);
+    VALUES ('delete', OLD.sqlite_id, OLD.title, OLD.body_cache);
 END;
 
 CREATE TRIGGER prompts_au AFTER UPDATE ON prompts BEGIN
     INSERT INTO prompts_fts(prompts_fts, rowid, title, body_cache)
-    VALUES ('delete', OLD.rowid, OLD.title, OLD.body_cache);
+    VALUES ('delete', OLD.sqlite_id, OLD.title, OLD.body_cache);
     INSERT INTO prompts_fts(rowid, title, body_cache)
-    VALUES (NEW.rowid, NEW.title, NEW.body_cache);
+    VALUES (NEW.sqlite_id, NEW.title, NEW.body_cache);
 END;
 ```
 
@@ -197,6 +239,14 @@ END;
 ```markdown
 ---
 id: 2f2b1d9c-8b9d-4f4d-9b5f-2a1b1b2c3d4e
+title: Code Review Assistant
+tags:
+  - swift
+  - code-review
+category: Engineering
+favorite: true
+created_at: 2026-01-22T00:00:00Z
+updated_at: 2026-01-22T00:00:00Z
 ---
 
 # Code Review Assistant
@@ -210,7 +260,10 @@ Review the code for {{language}} focusing on:
 {{context}}
 ```
 
-**Front matter:** Only `id` required. All other metadata lives in SQLite for fast queries and to avoid file rewrites on metadata changes.
+**Front matter (recommendation):**
+- Required: `id`
+- Recommended for portability/rebuild: `title`, `tags`, `category`, `favorite`, timestamps
+- SQLite is the fast index; when files and DB disagree, **file wins** after conflict resolution rules (see §2.4).
 
 ### 4.3 Swift Models
 
@@ -293,6 +346,10 @@ struct VaultScanResult {
 }
 ```
 
+**Vault scan performance (recommendation):**
+- Track `mtime` + file size and only re-hash/re-parse files whose attributes changed.
+- Treat cloud sync artifacts as normal input: files like `*.icloud`, `* (conflicted copy)*`, and temporary editor swap files should be ignored by default.
+
 ### 5.2 PromptStore
 
 SQLite operations via GRDB.
@@ -311,6 +368,7 @@ struct SearchFilters {
     var tags: [Tag]?
     var category: Category?
     var favoritesOnly: Bool
+    var includeArchived: Bool
     var sortBy: SortOption
 }
 
@@ -331,6 +389,13 @@ protocol VariableResolving: Sendable {
     func resolve(content: String, values: [String: String]) -> String
 }
 ```
+
+**Variable grammar (recommendation):**
+- Token form: `{{ name }}` (whitespace allowed around name)
+- Name regex: `[A-Za-z_][A-Za-z0-9_.-]*`
+- Optional inline default: `{{name=default value}}` (default runs until `}}`; no nesting in MVP)
+- Escaping: `\{{` renders a literal `{{` and does not start a token
+- Substitution scope: apply to the Markdown body only (exclude YAML front matter)
 
 ### 5.4 WorkflowStore
 
@@ -457,10 +522,13 @@ App/
 - [ ] Implement SQLite schema + migrations (GRDB)
 - [ ] Implement `PromptStore` (CRUD, search with FTS5)
 - [ ] Implement `VaultManager` (file ops, vault scanning)
-- [ ] Implement file ↔ DB sync logic
+- [ ] Implement file ↔ DB sync logic (file canonical, DB derived)
 - [ ] Implement content hashing for change detection
-- [ ] Handle external file edits gracefully (hash mismatch → reload)
+- [ ] Handle external file edits gracefully
+  - Detect changes via mtime/size/hash
+  - If prompt is open in editor: show conflict UI (Keep Mine / Use Disk / Duplicate)
 - [ ] Vault location migration helper
+  - Store security-scoped bookmarks (sandbox-compatible)
 - [ ] Optional backup service (configurable)
 - [ ] Unit tests for storage layer
 
@@ -509,6 +577,7 @@ App/
 - [ ] Export single prompt as .md
 - [ ] Export full library as .zip
 - [ ] Handle ID conflicts on import
+- [ ] Handle weird files safely (non-UTF8, huge files, symlinks, cloud placeholders, conflicted copies)
 - [ ] File dialogs, progress indicators
 
 #### 1.8 Polish & Release Prep
@@ -645,10 +714,11 @@ PromptHoarder-Export-2024-01-15/
 | Risk | Impact | Likelihood | Mitigation |
 |------|--------|------------|------------|
 | FTS search too slow at scale | High | Low | Benchmark early, optimize queries, consider external index |
-| File/DB sync drift | High | Medium | Hash-based change detection, periodic full scan, rebuild command |
+| File/DB sync drift | High | Medium | File canonical, DB derived; hash + mtime/size; rebuild command; conflict UI |
 | Menu bar popover focus issues | Medium | Medium | Test across macOS versions, fallback behaviors |
 | Accessibility permission UX | Medium | Medium | Clear onboarding, graceful degradation |
 | Markdown parsing edge cases | Low | Medium | Use Apple's swift-markdown, sanitize input |
+| Multi-process contention (future CLI) | Medium | Medium | WAL mode; single-writer coordinator; file-level locks/coordinator; clear error UX |
 
 ---
 
