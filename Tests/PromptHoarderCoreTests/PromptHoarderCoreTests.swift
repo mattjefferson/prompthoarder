@@ -1,5 +1,5 @@
-import XCTest
 @testable import PromptHoarderCore
+import XCTest
 
 final class PromptHoarderCoreTests: XCTestCase {
     func testVersionIsNotEmpty() {
