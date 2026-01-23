@@ -7,6 +7,8 @@ struct MenuBarView: View {
     @State private var searchQuery = ""
     @State private var selectedTab: MenuBarTab = .favorites
     @State private var selectedIndex = 0
+    @State private var activePrompt: PromptSummary?
+    @State private var activeVariables: [PromptVariable] = []
 
     private var results: [PromptSummary] {
         var prompts = viewModel.allPrompts
@@ -69,12 +71,26 @@ struct MenuBarView: View {
         }
         .onKeyPress(.return) {
             guard results.indices.contains(selectedIndex) else { return .handled }
-            viewModel.incrementUsage(id: results[selectedIndex].id)
+            activateSelection()
             return .handled
         }
         .onKeyPress(.escape) {
             NSApp.keyWindow?.performClose(nil)
             return .handled
+        }
+        .sheet(item: $activePrompt) { prompt in
+            VariableResolverSheet(
+                prompt: prompt,
+                variables: activeVariables,
+                onCopy: { resolved in
+                    copyToClipboard(resolved)
+                    viewModel.incrementUsage(id: prompt.id)
+                    closePopover()
+                },
+                onCancel: {
+                    closePopover()
+                }
+            )
         }
     }
 
@@ -127,6 +143,10 @@ struct MenuBarView: View {
                                 .onTapGesture {
                                     selectedIndex = index
                                 }
+                                .onTapGesture(count: 2) {
+                                    selectedIndex = index
+                                    activateSelection()
+                                }
                         }
                     }
                     .listStyle(.plain)
@@ -161,6 +181,49 @@ struct MenuBarView: View {
     private func openMainWindow() {
         NSApp.activate(ignoringOtherApps: true)
         NSApp.windows.first { $0.isVisible }?.makeKeyAndOrderFront(nil)
+    }
+
+    private func activateSelection() {
+        guard results.indices.contains(selectedIndex) else { return }
+        let prompt = results[selectedIndex]
+        let variables = extractVariables(from: prompt.content)
+        if variables.isEmpty {
+            copyToClipboard(prompt.content)
+            viewModel.incrementUsage(id: prompt.id)
+            closePopover()
+        } else {
+            activeVariables = variables
+            activePrompt = prompt
+        }
+    }
+
+    private func closePopover() {
+        activePrompt = nil
+        activeVariables = []
+        NSApp.keyWindow?.performClose(nil)
+    }
+
+    private func copyToClipboard(_ content: String) {
+        let pasteboard = NSPasteboard.general
+        pasteboard.clearContents()
+        pasteboard.setString(content, forType: .string)
+    }
+
+    private func extractVariables(from content: String) -> [PromptVariable] {
+        guard let regex = try? NSRegularExpression(pattern: "\\{\\{\\s*([^}]+?)\\s*\\}\\}") else {
+            return []
+        }
+        let nsContent = content as NSString
+        let matches = regex.matches(in: content, range: NSRange(location: 0, length: nsContent.length))
+        var seen = Set<String>()
+        var variables: [PromptVariable] = []
+        for match in matches {
+            guard match.numberOfRanges > 1 else { continue }
+            let raw = nsContent.substring(with: match.range(at: 1)).trimmingCharacters(in: .whitespacesAndNewlines)
+            guard !raw.isEmpty, seen.insert(raw).inserted else { continue }
+            variables.append(PromptVariable(id: raw))
+        }
+        return variables
     }
 }
 
